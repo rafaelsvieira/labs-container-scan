@@ -1,0 +1,83 @@
+name: Scan image
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  scanImage:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: "local/test"
+      TRIVY_VERSION: "0.53.0"
+      COPA_VERSION: "0.7.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up docker
+        # if: steps.vuln_count.outputs.vuln_count != '0'
+        uses: crazy-max/ghaction-setup-docker@v3
+        id: docker_info
+        with:
+          version: latest
+          daemon-config: |
+            {
+              "experimental": true,
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
+
+      - name: Install Trivy
+        run: |
+          curl -sL https://github.com/aquasecurity/trivy/releases/download/v${{ env.TRIVY_VERSION }}/trivy_${{ env.TRIVY_VERSION }}_Linux-64bit.tar.gz \
+                -o /tmp/trivy.tar.gz
+          tar -xvf /tmp/trivy.tar.gz trivy
+          mkdir -p $HOME/.local/bin/
+          mv trivy $HOME/.local/bin/
+          rm /tmp/trivy.tar.gz
+          trivy version
+
+      - name: Install COPA
+        run: |
+          curl -sL https://github.com/project-copacetic/copacetic/releases/download/v${{ env.COPA_VERSION }}/copa_${{ env.COPA_VERSION }}_linux_amd64.tar.gz \
+                -o /tmp/copa.tar.gz
+          tar -xvf /tmp/copa.tar.gz copa
+          mkdir -p $HOME/.local/bin/
+          mv copa $HOME/.local/bin/
+          rm /tmp/copa.tar.gz
+          copa --version
+
+          export BUILDKIT_VERSION=v0.12.4
+          docker run \
+              --detach \
+              --rm \
+              --privileged \
+              --name buildkitd \
+              --entrypoint buildkitd \
+              "moby/buildkit:$BUILDKIT_VERSION"
+
+      - name: Build an image from Dockerfile
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Trivy scanner - Generate vunerability report
+        run: |
+          echo "SCAN_FILE_NAME=/tmp/${{ github.sha }}.vuln.json" >> $GITHUB_ENV
+          source $GITHUB_ENV
+          trivy image --docker-host ${{ steps.docker_info.outputs.sock }} --vuln-type os --format json --output ${SCAN_FILE_NAME} ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          echo "::group::Result JSON"
+          cat ${SCAN_FILE_NAME}
+          echo "::endgroup::"
+
+      - name: Run OPA with fix
+        run: |
+          docker images
+          docker ps
+          copa patch -i ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+                     -r ${SCAN_FILE_NAME} \
+                     --timeout 1m \
+                     --addr docker-container://buildkitd \
+                     --debug ${{ env.IMAGE_NAME }}:${{ github.sha }}-patched
+          docker images
